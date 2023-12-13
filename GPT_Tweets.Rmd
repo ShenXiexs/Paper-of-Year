@@ -1,0 +1,702 @@
+---
+title: "GPT_Tweets"
+author: "Shen Xie"
+date: "2023/2/25"
+output:
+  slidy_presentation: default
+  ioslides_presentation: default
+  beamer_presentation: default
+---
+
+```{r setup, echo = FALSE, message = FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(tidyverse)
+library(stringr)
+library(textcat)
+library(tm)
+library(wordcloud) 
+library(wordcloud2)   # wordcloud
+library(quanteda)     # readability
+library(quanteda.textstats)
+library(quanteda.textplots)
+library(syuzhet)      # sentiment analysis
+library(quanteda.sentiment) # sentiment analysis for cluster test
+library(MASS)         # run regression
+library(stargazer)    # output form
+library(RColorBrewer)
+
+#   library(keras)
+```
+
+
+# 导入数据并进行数据预处理
+
+-- 读取数据
+```{r}
+Tweets_raw <- read.csv("ChatGPT_Tweets.csv", stringsAsFactors = FALSE, header = TRUE)
+```
+
+
+= 测试1：测试数据是否为UTF-8且不为空
+```{r 测试数据是否为UTF-8其不为空, eval=FALSE, include=FALSE}
+# 首先我们筛选出UTF-8格式的评论且非空的评论
+Tweets <- Tweets_raw %>%
+  # 筛选需要的评论
+  mutate(
+    Tweet = iconv(Tweet,"UTF-8", "UTF-8",sub="")
+  ) %>%
+  filter(!is.na(Tweet)) 
+```
+
+
+**预处理数据：基本列情况分析**
+```{r 数据预处理1}
+
+Tweets <- Tweets_raw %>%
+  # 处理日期，由于GPT是22年11月推出（可选：我们选择滞后两个月的评论，评价会更加有意义）
+  mutate(Date=as.Date(Date),
+         year = as.numeric(substr(Date, 1, 4)),
+         Month = as.numeric(substr(Date, 6, 7)),
+         CreatDate = as.Date(UserCreated),
+         Day_Gap = as.numeric(difftime( as.Date("2023-02-25"), Date, units = "days"))
+         ) %>%
+  # filter(year==2023) %>%
+  # 筛选verified的用户，避免水军行为
+  # filter(UserVerified=="TRUE")，数据量将大大减少，只剩下8738行
+  # 通过Url生成ID列，同时注意去除空ID
+  mutate(ID = str_extract(Url, "\\d{14}$")) %>%
+  filter(!is.na(ID)) %>% # 此时剩下305399（223070）行数据
+  # 去除文本中http:内容，然后匹配文本中#后面的内容，这相当于tag
+  mutate(
+    Tweet = gsub("https:.*", "", Tweet),
+    Tweet = iconv(Tweet, to = 'UTF-8')
+    ) %>%
+  # 字数统计，多样性统计
+  mutate(
+    WC = str_count(Tweet,boundary("word")),
+    Lexical_Diversity = map_dbl(str_extract_all(str_to_lower(Tweet), "\\w+"), ~ length(unique(.x)) / length(.x))
+    ) %>%
+  # 修改Likes和Retweets的格式
+  mutate(
+    Likes = as.numeric(Likes),
+    Like_Perday = Likes/Day_Gap,
+    Retweets = as.numeric(Retweets),
+    Retweet_Perday = Retweets/Day_Gap
+  ) %>%
+  # 根据用户是否认证生成0-1
+  mutate(User_Verified = ifelse(UserVerified=="TRUE",1,0)) %>%
+  # 选出需要使用的列，同时安排顺序
+  dplyr::select(ID, User, UserDescription, Location, CreatDate, User_Verified, UserFollowers, UserFriends, Tweet, Date, Month, Day_Gap, Likes, Like_Perday, Retweets, Retweet_Perday, WC, Lexical_Diversity)
+
+```
+
+= 测试2： 检验ID是否有重复
+```{r 检验ID是否有重复, eval=FALSE, include=FALSE}
+Tweets %>%
+  group_by(ID) %>%
+  mutate(number = row_number()) %>%
+  filter(number>1)
+# 结果表明无重复
+```
+
+**预处理数据：识别身份特征**
+
+```{r}
+# 身份词典
+NLP_D <- "\\b(NLProc|ACL|NAACL|CoNNL|COLING|EMNLP|NLP|nlp|TLE|SALLE|POS|Literal Annotation|Lemma|multilingual|fine tune|textual analysis|text analysis|GPT|GPT-3|GPT-3.5)\\b"
+
+CSEEDS_D <- "\\b(CS|cs|computer science|EE|ee|Electrical Engineering|electrical engineering|DS|ds|data scientist|Data Scientist|data science|data analyst|ML|ml|DL|dl|machine learning|Machine Learning|Deep Learning|deep learning)\\b"
+
+Research_D <- "\\b(PhD|phd|Researcher|researcher|Professor|professor|lab|laboratory|LAB|Lab|CTO|cto)\\b"
+
+Expert_D <- "\\b(NLProc|ACL|NAACL|CoNNL|COLING|EMNLP|NLP|nlp|TLE|SALLE|POS|Literal Annotation|Lemma|multilingual|fine tune|textual analysis|text analysis|GPT|GPT-3|GPT-3.5|CS|cs|computer science|EE|ee|Electrical Engineering|electrical engineering|DS|ds|data scientist|Data Scientist|data science|data analyst|ML|ml|DL|dl|machine learning|Machine Learning|Deep Learning|deep learning|PhD|phd|Researcher|researcher|Professor|professor|lab|laboratory|LAB|Lab|CTO|cto)\\b"
+```
+
+
+```{r}
+Tweets_User <- Tweets%>%
+  filter(!is.na(UserDescription)) %>%
+  mutate(
+    UserDescription = iconv(UserDescription, to = 'UTF-8'),
+    WC_Descrip = str_count(UserDescription,boundary("word")),
+    ) %>%
+  # 筛选Tweet有内容且用户有简介的部分
+  filter(WC > 2) %>%
+  filter(WC_Descrip > 1) %>% # 得到283132列
+  # 分组并生成UserID
+  group_by(User) %>%
+  mutate(UserID = cur_group_id()) %>%
+  ungroup() %>%
+  # 抓取与NLP有关的介绍
+  mutate(
+    NLP = ifelse(str_detect(UserDescription, NLP_D), 1, 0),
+    CSEEDS = ifelse(str_detect(UserDescription, CSEEDS_D), ifelse(NLP==0, 1, 0), 0),
+    Research = ifelse(str_detect(UserDescription, Research_D), 1, 0),
+    Expert = ifelse(str_detect(UserDescription, Expert_D), 1, 0)
+  ) %>%
+  dplyr::select(ID, UserID, User, UserDescription, WC_Descrip, Expert, NLP, CSEEDS, Research, Location, CreatDate, User_Verified, UserFollowers, UserFriends, Tweet, Date, Month, Day_Gap, Likes, Like_Perday, Retweets, Retweet_Perday, WC, Lexical_Diversity)
+  
+```
+
+= 测试3：检验User是否有多发——有，可以考虑情绪是否存在变化
+```{r}
+Tweets_User %>%
+  group_by(UserID) %>%
+  mutate(n = n()) %>%
+  filter(n>1)
+```
+
+= 测试4：检验UserID是否有重复
+```{r}
+Tweets_User %>%
+  group_by(UserID, User) %>%
+  mutate(n = n()) %>%
+  filter(n>1)
+# 与测试3输出结果一致，说明没问题！
+```
+
+= 测验5 检测有多少用户生成的内容
+```{r}
+Tweets_User %>%
+  filter(Expert == 1) %>%
+  # 有26008行
+  group_by(UserID)
+  # 来自于9470位用户
+
+Tweets_User %>%
+  filter(NLP == 1) %>%
+  # 有2698行，太少了
+  group_by(UserID)
+  # 来自于641位用户
+
+Tweets_User %>%
+  filter(CSEEDS == 1) %>%
+  # 有11143行
+  group_by(UserID)
+  # 来自于3153位用户
+
+Tweets_User %>%
+  filter(Research == 1) %>%
+  # 有14952行
+  group_by(UserID)
+  # 来自于6343位用户
+```
+
+**预处理数据：推文层面分析**
+
+DayGap: 截止爬取时间2023.2.25，推文发出时间；
+LikePerD：用于表示内容认同度，平均每天的获赞量；
+RetweetPerD：用于表示传播影响力，平均每天的转推量；
+
+```{r}
+mean(Tweets_User$Like_Perday)
+mean(Tweets_User$Retweet_Perday)
+```
+
+感兴趣的是推文的质量与影响力，因此选取大于0的部分
+```{r}
+Tweets_User2 <- Tweets_User %>%
+  filter(Like_Perday>0) %>%
+  filter(Retweet_Perday>0)
+```
+
+= 测验6 检测在筛选后有多少NLP用户生成的内容
+```{r}
+Tweets_User2 %>%
+  filter(Expert == 1) %>%
+  # 有6684行
+  group_by(UserID)
+  # 来自于3244位用户
+
+Tweets_User2 %>%
+  filter(NLP == 1) %>%
+  # 有809行，太少了
+  group_by(UserID)
+  # 来自于254位用户
+
+Tweets_User2 %>%
+  filter(CSEEDS == 1) %>%
+  # 有2548行
+  group_by(UserID)
+  # 来自于978位用户
+
+Tweets_User2 %>%
+  filter(Research == 1) %>%
+  # 有3830行
+  group_by(UserID)
+  # 来自于2276位用户
+```
+
+
+```{r}
+mean(Tweets_User2$Like_Perday)
+mean(Tweets_User2$Retweet_Perday)
+```
+
+```{r 数据预处理2}
+# 提出疑问？用中位数好还是？
+Tweets_User2 <- Tweets_User2 %>%
+  mutate(
+    LikeType = ifelse(Like_Perday>=1.5*mean(Like_Perday), "MostLike",
+                      ifelse(Like_Perday<0.5*mean(Like_Perday),"LeastLike", "MedianLike")),
+    RetweetType = ifelse(Retweet_Perday>=1.5*mean(Retweet_Perday), "MostRetweet",
+                      ifelse(Retweet_Perday<0.5*mean(Retweet_Perday),"LeastRetweet", "MedianRetweet")),
+    Most_Popular = ifelse(LikeType=="MostLike", ifelse(RetweetType=="MostRetweet",1,0),0)
+    )
+```
+
+= 测验7 查看处理后变量的基本情况
+```{r}
+Tweets_User2 %>%
+  ggplot(aes(x = LikeType)) +
+  #geom_freqpoly(binwidth = 5) +
+  geom_bar(fill = brewer.pal(6, "Set1")[2]) +
+  labs(title = "Likes Distribution", x = "Likes", y = "Tweets Count")
+
+Tweets_User2 %>%
+  ggplot(aes(x = RetweetType)) +
+  #geom_freqpoly(binwidth = 5) +
+  geom_bar(fill = brewer.pal(6, "Set1")[2]) +
+  labs(title = "Retweet Distribution", x = "Retweets", y = "Tweets Count")
+
+Tweets_User2 %>%
+  ggplot(aes(x = Most_Popular)) +
+  #geom_freqpoly(binwidth = 5) +
+  geom_bar(fill = brewer.pal(6, "Set1")[2]) +
+  labs(title = "MostValuable Distribution", x = "MostValuable", y = "Tweets Count")
+```
+
+= 测验8 查看处理后变量的分组情况
+```{r}
+Tweets_Graph1 <- Tweets_User2 %>%
+  group_by(LikeType, Expert) %>%
+  mutate(numL = n()) %>%
+  slice(1) %>%
+  ungroup() %>%
+  dplyr::select(Expert, LikeType, numL)
+
+Tweets_Graph1 %>%
+  ggplot(aes(x = LikeType, y = numL, fill = Expert)) +
+   geom_bar(stat = "identity", position = position_dodge(width = 0.7)) +
+  geom_text(aes(label = numL,  color = Expert), position = position_dodge(width = 0.8), vjust = -0.5)
+
+
+Tweets_Graph2 <- Tweets_User2 %>%
+  group_by(RetweetType, Expert) %>%
+  mutate(numR = n()) %>%
+  slice(1) %>%
+  ungroup() %>%
+  dplyr::select(Expert, RetweetType, numR)
+
+Tweets_Graph2 %>%
+  ggplot(aes(x = RetweetType, y = numR, fill = Expert)) +
+   geom_bar(stat = "identity", position = position_dodge(width = 0.7)) +
+  geom_text(aes(label = numR, color = Expert), position = position_dodge(width = 0.8), vjust = -0.5)
+```
+
+```{r}
+remove(Tweets_Graph1)
+remove(Tweets_Graph2)
+```
+
+= 测验9 箱形图探究
+```{r User2探究总量}
+Tweets_User2 %>%
+  ggplot(aes(x = Likes, group = Expert, fill = Expert)) +
+  geom_boxplot()  +
+  xlim(0, 15)
+
+Tweets_User2 %>%
+  ggplot(aes(x = Retweets, group = Expert, fill = Expert)) +
+  geom_boxplot() +
+  xlim(0, 15)
+```
+
+```{r User2探究perD}
+Tweets_User2 %>%
+  ggplot(aes(x = Like_Perday, group = Expert, fill = Expert)) +
+  geom_boxplot() +
+  xlim(0, 0.15)
+
+Tweets_User2 %>%
+  ggplot(aes(x = Retweet_Perday, group = Expert, fill = Expert)) +
+  geom_boxplot() +
+  xlim(0, 0.1)
+```
+
+# 可视化探究——基本信息展示
+
+**1. 评论中单词个数的分布**
+```{r}
+summary(Tweets_User2$WC)
+
+Tweets_User2%>%
+  filter(Expert==1) %>%
+  ggplot(aes(x = WC)) +
+  #geom_freqpoly(binwidth = 5) +
+  geom_histogram(fill = brewer.pal(6, "Set1")[2]) +
+  labs(title = "Words Distribution", x = "Words", y = "Tweet Count") +
+  xlim(0,70) +
+  stat_bin(aes(label = ..count..), geom = "text", vjust = -0.5, size = 2.2)
+
+Tweets_User2%>%
+  filter(Expert==0) %>%
+  ggplot(aes(x = WC)) +
+  #geom_freqpoly(binwidth = 5) +
+  geom_histogram(fill = brewer.pal(6, "Set1")[2]) +
+  labs(title = "Words Distribution", x = "Words", y = "Tweet Count") +
+  xlim(0,70) +
+  stat_bin(aes(label = ..count..), geom = "text", vjust = -0.5, size = 2.2)
+```
+
+**2. 随着时间变化评论数量变化**
+```{r}
+
+Tweets_User2 %>%
+  group_by(Date, Expert) %>%
+  mutate(Num = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = Date, y = Num, group = Expert, color = Expert)) +
+  geom_line(size = 1) +
+  labs(title = "Date Distribution", x = "Date", y = "Tweets Count") 
+
+Tweets_User2 %>%
+  ggplot(aes(x = Month, group = Expert, color = Expert)) +
+  geom_histogram(size = 1) +
+  labs(title = "Date Distribution", x = "Date", y = "Tweets Count")
+
+```
+
+专家具有持续关注性！
+
+**3. 查看点赞以及转推数量，参考上一节讲解的内容**
+参考上一节讲解的内容。
+
+
+# 对文本进行处理
+
+**1.文本预处理**
+
+首先得到基础的语料库，然后进行标准化操作，并生成DF：
+
+```{r}
+# 方法：参考quanteda资料，使用corpus的方法生成，更有利于处理（ref1:https://quanteda.io/articles/pkgdown/quickstart_cn.html；ref2:https://zhuanlan.zhihu.com/p/439456688）
+
+# 去除文本中的Emoji符号
+Tweet_noemoji <- gsub("[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]", "", Tweets_User2$Tweet, perl = TRUE)
+# Des_noemoji <- gsub("[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]", "", Tweets$UserDescription, perl = TRUE)
+
+
+# 生成语料库
+Tweet_corpus <- corpus(Tweet_noemoji)
+# Des_corpus <- corpus(Des_noemoji)
+```
+
+**2.可读性分析与情感分析**
+
+使用quanteda.sentiment生成情感分析的变量。由于两种函数所包含的共同词典仅有nrc词典，所以均采用nrc词典进行情感提取
+
+```{r}
+Tweets_User3 <- Tweets_User2 %>%
+  mutate(
+    Readability = textstat_readability(Tweet_corpus, measure = "Flesch.Kincaid")$Flesch.Kincaid,
+    Sentiment = as_tibble(textstat_polarity(Tweet_corpus, dictionary = data_dictionary_NRC))$sentiment
+  )
+```
+
+== 可选：情感分析使用的是syuzhet包的函数，但是运行速度会很慢
+```{r 可选测试, eval=FALSE, include=FALSE}
+# Tweets <- Tweets %>%
+#  mutate(
+#    sentiment_test = get_sentiment(Tweet_noemoji, method = "nrc")
+#  )
+```
+
+- 可视化操作：对于文本可读性
+```{r}
+Tweets_User3 %>%
+  ggplot(aes(x = Readability, group = Expert, fill = Expert)) +
+  geom_boxplot() +
+  xlim(0, 18)
+
+Tweets_User3 %>%
+  ggplot(aes(x = Readability, group = NLP, fill = NLP)) +
+  geom_boxplot() +
+  xlim(0, 18)
+
+Tweets_User3 %>%
+  ggplot(aes(x = Readability, group = Research, fill = Research)) +
+  geom_boxplot() +
+  xlim(0, 18)
+
+Tweets_User3 %>%
+  ggplot(aes(x = Readability, group = CSEEDS, fill = CSEEDS)) +
+  geom_boxplot() +
+  xlim(0, 18)
+```
+
+- 可视化操作：对于文本情感得分
+```{r}
+Tweets_User3 %>%
+  ggplot(aes(x = Sentiment, group = Expert, fill = Expert)) +
+  geom_boxplot() +
+  xlim(0, 3)
+
+Tweets_User3 %>%
+  ggplot(aes(x = Sentiment, group = NLP, fill = NLP)) +
+  geom_boxplot() +
+  xlim(0, 3)
+
+Tweets_User3 %>%
+  ggplot(aes(x = Sentiment, group = Research, fill = Research)) +
+  geom_boxplot() +
+  xlim(0, 3)
+
+Tweets_User3 %>%
+  ggplot(aes(x = Sentiment, group = CSEEDS, fill = CSEEDS)) +
+  geom_boxplot() +
+  xlim(0, 3)
+```
+
+**3. TF-IDF与专家分组(内存不够，做不了)**
+
+```{r eval=FALSE, include=FALSE}
+# 方法：参考quanteda资料，使用corpus的方法生成，更有利于处理（ref1:https://quanteda.io/articles/pkgdown/quickstart_cn.html；ref2:https://zhuanlan.zhihu.com/p/439456688）
+# 生成语料库
+# 将文本数据转化为Corpus对象
+UserDescription_Corpus <- Corpus(VectorSource(Tweets_User3$UserDescription))
+
+# 清理文本数据
+UserDescription_Corpus <- tm_map(UserDescription_Corpus, content_transformer(tolower))  # 转为小写
+UserDescription_Corpus <- tm_map(UserDescription_Corpus, removeNumbers)  # 删除数字
+UserDescription_Corpus <- tm_map(UserDescription_Corpus, removePunctuation)  # 删除标点符号
+UserDescription_Corpus <- tm_map(UserDescription_Corpus, stripWhitespace)  # 删除多余的空格
+UserDescription_Corpus <- tm_map(UserDescription_Corpus, removeWords, stopwords("english"))  # 删除停用词
+UserDescription_Corpus <- tm_map(UserDescription_Corpus, stemDocument, language = "english")  # 词干提取
+
+# 将Corpus对象转化为Document-Term Matrix
+UserDescription_DTM <- DocumentTermMatrix(UserDescription_Corpus)
+
+# 将Document-Term Matrix转化为dataframe
+UserDescription_DF <- as.data.frame(as.matrix(UserDescription_DTM))
+```
+
+# 回归分析
+
+**注意回归分析中各项系数与老师给出的回归系数的差异，还存在许多细微的差异！**
+
+用户层面：UserID, User, UserDescription, WC_Descrip, Relate, NLP, CSEEDS, Research, Location, CreatDate, User_Verified, UserFollowers, UserFriends
+
+推文层面：ID, Tweet, Date, Month, Day_Gap, Likes, LikePerD, Retweets, RetweetPerD, WC, LikeType, RetweetType, MostValuable, readability_Tweet, sentiment_Tweet
+
+```{r}
+Tweets_Reg <- Tweets_User3 %>%
+  mutate(
+    Followers = log(UserFollowers + 1),
+    Friends = log(UserFriends + 1)     
+    ) %>%
+  mutate(
+    Sentiment_Test = Sentiment,
+    Sentiment = scale(abs(Sentiment), center=F,scale=T)
+  ) %>%
+  dplyr::select(Most_Popular, Expert, NLP, CSEEDS, Research, User_Verified, Followers, Friends, Day_Gap, Like_Perday, Retweet_Perday, WC, Lexical_Diversity, Readability, Sentiment, Sentiment_Test)
+```
+
+**进行回归分析探究**
+
+```{r}
+summary(Tweets_Reg$Sentiment)
+sd(Tweets_Reg$Sentiment)
+```
+
+```{r}
+summary(Tweets_Reg$WC)
+sd(Tweets_Reg$WC)
+```
+
+```{r}
+summary(Tweets_Reg$Readability)
+sd(Tweets_Reg$Readability)
+```
+```{r}
+summary(Tweets_Reg$Day_Gap)
+sd(Tweets_Reg$Day_Gap)
+```
+
+```{r}
+summary(Tweets_Reg$Lexical_Diversity)
+sd(Tweets_Reg$Lexical_Diversity)
+```
+
+```{r echo=FALSE}
+library(ggcorrplot) 
+library(gridExtra)
+
+corstroke <- round(cor(Tweets_Reg), 3) #round()函数自定义小数点后位数
+#相关性矩阵
+
+#相关性的显著性
+pstroke <- cor_pmat(Tweets_Reg)
+corplot <- ggcorrplot(corstroke,hc.order = T,  #分等级聚类重排矩阵
+           ggtheme = ggplot2::theme_void(base_size = 15), #主题修改
+           colors = c("CornflowerBlue","white","Salmon"), #自定义颜色
+           lab = T,lab_size = 3,    #相关系数文本字体大小
+           tl.cex = 10,             #坐标轴字体大小
+           )
+corplot
+```
+
+```{R}
+# Model1与2探究可读性以及情感得分与用户特征，但是R2很低
+
+Model_Read1 = lm(Readability~
+               Expert + 
+               User_Verified +
+               WC+
+               Lexical_Diversity,
+              Tweets_Reg)
+
+Model_Read2 = lm(Readability~
+               NLP +
+               CSEEDS +
+               User_Verified +
+               WC+
+               Lexical_Diversity,
+              Tweets_Reg)
+
+```
+
+```{r}
+# 输出规范的三线表
+stargazer(list(Model_Read1, Model_Read2),type = "text")
+```
+
+```{R}
+# Model探究最受欢迎的文本与什么因素有关
+Model_Pop1 = glm(Most_Popular~
+               Sentiment +
+               WC +
+               Lexical_Diversity +
+               Readability +
+               Day_Gap + 
+               Followers +
+               Friends + 
+               Expert +
+               User_Verified,
+              Tweets_Reg, family=binomial)
+
+Model_Pop2 = glm(Most_Popular~
+               Sentiment +
+               WC +
+               Lexical_Diversity +
+               Readability +
+               Day_Gap + 
+               Followers +
+               Friends + 
+               NLP +
+               CSEEDS +
+               Research +
+               User_Verified,
+              Tweets_Reg, family=binomial)
+```
+
+```{r}
+# 输出规范的三线表
+stargazer(list(Model_Pop1, Model_Pop2),type = "text")
+# summary(Model3)
+```
+
+```{r}
+summary(Model_Pop1)
+```
+
+```{r}
+mean(Tweets_Reg$Most_Popular)
+sd(Tweets_Reg$Most_Popular)
+```
+
+```{R include=FALSE}
+# Model探究最受欢迎的文本与什么因素有关
+Model_Pop1_nb = glm.nb(Most_Popular~
+               Sentiment +
+               WC +
+               Lexical_Diversity +
+               Readability +
+               Day_Gap + 
+               Followers +
+               Friends + 
+               Expert +
+               User_Verified,
+              Tweets_Reg, link = log)
+
+Model_Pop2_nb = glm.nb(Most_Popular~
+               Sentiment +
+               WC +
+               Lexical_Diversity +
+               Readability +
+               Day_Gap + 
+               Followers +
+               Friends + 
+               NLP +
+               CSEEDS +
+               Research +
+               User_Verified,
+              Tweets_Reg, link = log)
+```
+
+```{r}
+# 输出规范的三线表
+stargazer(list(Model_Pop1_nb, Model_Pop2_nb),type = "text")
+# summary(Model3)
+```
+
+```{R}
+# Model3探究最受欢迎的文本与什么因素有关
+Model_Pop3 = glm(Most_Popular~
+               Sentiment_Test +
+               WC +
+               Lexical_Diversity +
+               Readability +
+               Day_Gap + 
+               Followers +
+               Friends + 
+               Expert +
+               User_Verified,
+              Tweets_Reg, family=binomial)
+
+Model_Pop4 = glm(Most_Popular~
+               Sentiment_Test +
+               WC +
+               Lexical_Diversity +
+               Readability +
+               Day_Gap + 
+               Followers +
+               Friends + 
+               NLP +
+               CSEEDS +
+               Research +
+               User_Verified,
+              Tweets_Reg, family=binomial)
+
+Model_Pop5 = glm(Most_Popular~
+               Sentiment_Test +
+               WC +
+               Lexical_Diversity +
+               Readability +
+               Day_Gap + 
+               Followers +
+               Friends + 
+               User_Verified,
+              Tweets_Reg, family=binomial)
+
+```
+
+```{r}
+# 输出规范的三线表
+stargazer(list(Model_Pop3, Model_Pop4, Model_Pop5),type = "text")
+# summary(Model3)
+```
